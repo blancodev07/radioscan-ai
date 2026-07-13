@@ -506,6 +506,7 @@
           <select id="providerSelect">
             <option value="gemini">Google Gemini (gemini-3.5-flash)</option>
             <option value="openai">OpenAI (gpt-4o)</option>
+            <option value="claude">Anthropic Claude (claude-sonnet-4-6)</option>
           </select>
           <label for="apiKeyInput">مفتاح API الخاص بك</label>
           <input type="password" id="apiKeyInput" placeholder="الصق مفتاح API الخاص بك هنا…">
@@ -692,7 +693,8 @@
 
   function updateModeBadge(){
     if(hasApiKey()){
-      modeBadge.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><path d="M20 6 9 17l-5-5"></path></svg> تم ضبط المفتاح: التحليل سيُرسَل فعلياً إلى ' + (providerSelect.value === 'gemini' ? 'Google Gemini' : 'OpenAI');
+      const providerLabels = { gemini: 'Google Gemini', openai: 'OpenAI', claude: 'Anthropic Claude' };
+      modeBadge.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><path d="M20 6 9 17l-5-5"></path></svg> تم ضبط المفتاح: التحليل سيُرسَل فعلياً إلى ' + (providerLabels[providerSelect.value] || providerSelect.value);
       modeBadge.style.background = 'var(--green-bg)';
       modeBadge.style.color = 'var(--green-fg)';
       modeBadge.style.borderColor = 'var(--green-line)';
@@ -870,7 +872,7 @@
       .then(finish)
       .catch(function(err){
         console.error(err);
-        fail();
+        fail(err && err.message ? err.message : null);
       });
   });
 
@@ -900,6 +902,10 @@
 
     let url, body, headers;
 
+    if(!apiKey){
+      throw new Error('الرجاء إدخال مفتاح API صالح.');
+    }
+
     if(provider === 'gemini'){
       url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=' + encodeURIComponent(apiKey);
       headers = { 'Content-Type': 'application/json' };
@@ -912,7 +918,7 @@
         }],
         generationConfig: { temperature: 0.2 }
       });
-    } else {
+    } else if(provider === 'openai'){
       url = 'https://api.openai.com/v1/chat/completions';
       headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey };
       body = JSON.stringify({
@@ -926,31 +932,99 @@
         ],
         temperature: 0.2
       });
+    } else if(provider === 'claude'){
+      url = 'https://api.anthropic.com/v1/messages';
+      headers = {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      };
+      body = JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1500,
+        temperature: 0.2,
+        system: systemPrompt,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'حلّل هذه الصورة الطبية.' },
+            { type: 'image', source: { type: 'base64', media_type: mimeType, data: base64Only } }
+          ]
+        }]
+      });
+    } else {
+      throw new Error('مزوّد ذكاء اصطناعي غير معروف: ' + provider);
     }
 
-    const res = await fetch(url, { method: 'POST', headers: headers, body: body });
-    if(!res.ok){
-      const errText = await res.text().catch(function(){ return ''; });
-      throw new Error('API request failed: ' + res.status + ' ' + errText);
+    let res;
+    try{
+      res = await fetch(url, { method: 'POST', headers: headers, body: body });
+    }catch(networkErr){
+      throw new Error('تعذّر الاتصال بخادم مزوّد الذكاء الاصطناعي. تحقق من اتصالك بالإنترنت وحاول مجدداً.');
     }
-    const data = await res.json();
+
+    if(!res.ok){
+      let errText = '';
+      try{
+        const errJson = await res.json();
+        errText = (errJson && errJson.error && (errJson.error.message || errJson.error)) ||
+                  (errJson && errJson.message) || JSON.stringify(errJson);
+      }catch(e){
+        errText = await res.text().catch(function(){ return ''; });
+      }
+      if(res.status === 401 || res.status === 403){
+        throw new Error('مفتاح API غير صالح أو غير مخوّل. تحقق منه وحاول مجدداً.');
+      }
+      if(res.status === 429){
+        throw new Error('تم تجاوز الحد المسموح من الطلبات لدى مزوّد الذكاء الاصطناعي. حاول مجدداً بعد قليل.');
+      }
+      throw new Error('فشل طلب API (' + res.status + '): ' + (errText || 'خطأ غير معروف'));
+    }
+
+    let data;
+    try{
+      data = await res.json();
+    }catch(e){
+      throw new Error('استجابة غير صالحة من الخادم.');
+    }
 
     let rawText = '';
     if(provider === 'gemini'){
-      rawText = data && data.candidates && data.candidates[0] && data.candidates[0].content &&
-                data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
-                data.candidates[0].content.parts[0].text ? data.candidates[0].content.parts[0].text : '';
-    } else {
+      const cand = data && data.candidates && data.candidates[0];
+      const parts = cand && cand.content && cand.content.parts;
+      rawText = (parts && parts[0] && parts[0].text) ? parts[0].text : '';
+      if(!rawText && cand && cand.finishReason){
+        throw new Error('لم يُرجع النموذج نتيجة (السبب: ' + cand.finishReason + ').');
+      }
+    } else if(provider === 'openai'){
       rawText = data && data.choices && data.choices[0] && data.choices[0].message &&
                 data.choices[0].message.content ? data.choices[0].message.content : '';
+    } else if(provider === 'claude'){
+      const blocks = data && data.content;
+      if(Array.isArray(blocks)){
+        const textBlock = blocks.find(function(b){ return b.type === 'text'; });
+        rawText = textBlock ? textBlock.text : '';
+      }
+    }
+
+    if(!rawText || !rawText.trim()){
+      throw new Error('لم يُعِد النموذج أي محتوى قابل للقراءة.');
     }
 
     rawText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
 
+    // Some models may wrap the JSON with stray text; extract the {...} block defensively.
     let parsed;
     try{
       parsed = JSON.parse(rawText);
     }catch(e){
+      const match = rawText.match(/\{[\s\S]*\}/);
+      if(match){
+        try{ parsed = JSON.parse(match[0]); }catch(e2){ parsed = null; }
+      }
+    }
+    if(!parsed){
       throw new Error('تعذّر تفسير استجابة النموذج كـ JSON صالح.');
     }
     return normalizeReportData(parsed);
